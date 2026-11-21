@@ -1011,7 +1011,7 @@ function drawLines(ctx, lines, x, top, PAD_X, PAD_Y, LH) {
   ctx.textBaseline = 'alphabetic';
 }
 
-function block(ctx, m, y, dry, T, zoom) {
+function block(ctx, m, y, dry, T, zoom, rectOut) {
   T = T || THEME();
   const FONT = '15.5px -apple-system, "PingFang SC", "Microsoft YaHei", sans-serif';
   const NAME_FONT = '11.5px -apple-system, "PingFang SC", "Microsoft YaHei", sans-serif';
@@ -1192,6 +1192,14 @@ function block(ctx, m, y, dry, T, zoom) {
     lines = wrap(ctx, m.text || '', MAXB - PAD_X * 2);
     bubbleW = Math.min(MAXB, Math.max(...lines.map(l => ctx.measureText(l).width)) + PAD_X * 2);
     bubbleH = lines.length * LH + PAD_Y * 2;
+  }
+
+  // 图片在画布上的位置：点开动画要从这里开始放大
+  if (rectOut && m.kind === 'image') {
+    rectOut.x = isRight ? W - SIDE - AVA - GAP - bubbleW : SIDE + AVA + GAP;
+    rectOut.y = y + nameH;
+    rectOut.w = bubbleW;
+    rectOut.h = bubbleH;
   }
 
   // 图片放大时，多出来的高度也计入占位，让画面整体上移腾出空间
@@ -2605,10 +2613,18 @@ let preloadFirstMsg = false;                 // 跳转后第一条消息直接�
 const NOTIF_DUR = 950;                       // 通知横幅停留毫秒
 const MOMENTS_DWELL = 2600;                  // 剧情里「打开朋友圈」停留毫秒
 const DISCOVER_DWELL = 1100;                  // 剧情里「发现页」停留毫秒
-const ZOOM_DUR = 1500;                        // 图片放大：放大 → 停留 → 复原 的总时长
+const ZOOM_DUR = 1500;                        // 旁白图片：放大 → 停留 → 复原 的总时长
 const ZOOM_AMP = 0.18;                        // 旁白图片最大放大 1.18 倍
-const ZOOM_AMP_IMG = 0.12;                    // 聊天里的图片放大得含蓄一点
-const ZOOM_EXTRA = 900;                       // 图片类消息在时间轴上额外的停留时间
+const ZOOM_EXTRA = 900;                       // 旁白图片在时间轴上额外的停留时间
+/* 聊天里的图片：先被「点一下」，再飞到屏幕正中放大，背景淡化，停 2 秒后复原 */
+const IMG_FX_TAP_AT    = 520;                 // 出现后多久开始按压
+const IMG_FX_TAP_DUR   = 150;                 // 按压持续
+const IMG_FX_OPEN_AT   = 780;                 // 开始放大
+const IMG_FX_OPEN_DUR  = 340;                 // 放大过程
+const IMG_FX_HOLD      = 2000;                // 放大后停留
+const IMG_FX_CLOSE_DUR = 320;                 // 复原过程
+const IMG_FX_TOTAL     = IMG_FX_OPEN_AT + IMG_FX_OPEN_DUR + IMG_FX_HOLD + IMG_FX_CLOSE_DUR;
+const IMG_FX_EXTRA     = IMG_FX_TOTAL + 260;  // 时间轴上给这条图片留的总时长
 // 0 → 1 → 0 的放大曲线：前 22% 放大，中间保持，最后复原
 function zoomCurve(p) {
   if (p <= 0 || p >= 1) return 0;
@@ -2617,11 +2633,64 @@ function zoomCurve(p) {
   if (p < HOLD) return 1;
   return 1 - easeOut((p - HOLD) / (1 - HOLD));
 }
-// 哪些消息播放时要放大：图片旁白、别人发的图片；表情和本人图片不放大
+// 播放时要小幅呼吸的：只有图片旁白（聊天图片走全屏点开动画）
 function needsZoom(m) {
-  if (!m) return false;
-  if (m.t === 'narrimg') return true;
-  return m.t === 'left' && m.kind === 'image';
+  return !!m && m.t === 'narrimg';
+}
+// 聊天图片的点开动画进度：null 表示不在动画里
+function imageFxAt(dt) {
+  if (dt < IMG_FX_TAP_AT) return null;
+  if (dt < IMG_FX_TAP_AT + IMG_FX_TAP_DUR) return { mode: 'tap', p: 1 };
+  if (dt < IMG_FX_OPEN_AT) return { mode: 'idle', p: 0 };
+  const openEnd = IMG_FX_OPEN_AT + IMG_FX_OPEN_DUR;
+  if (dt < openEnd) return { mode: 'open', p: easeOut((dt - IMG_FX_OPEN_AT) / IMG_FX_OPEN_DUR) };
+  const holdEnd = openEnd + IMG_FX_HOLD;
+  if (dt < holdEnd) return { mode: 'hold', p: 1 };
+  if (dt < holdEnd + IMG_FX_CLOSE_DUR) return { mode: 'close', p: 1 - easeOut((dt - holdEnd) / IMG_FX_CLOSE_DUR) };
+  return null;
+}
+// 放大后的目标框：屏幕正中，尽量大但不超出安全边距
+function previewRect(img) {
+  const maxW = W * 0.86, maxH = H * 0.62;
+  const s = Math.min(maxW / img.naturalWidth, maxH / img.naturalHeight);
+  const w = img.naturalWidth * s, h = img.naturalHeight * s;
+  return { x: (W - w) / 2, y: (H - h) / 2, w, h };
+}
+// 背景淡化 + 图片从原位飞到正中
+function drawImagePreviewOverlay(ctx, T, st) {
+  const p = st.p, from = st.rect, to = st.target;
+  const r = {
+    x: from.x + (to.x - from.x) * p,
+    y: from.y + (to.y - from.y) * p,
+    w: from.w + (to.w - from.w) * p,
+    h: from.h + (to.h - from.h) * p
+  };
+  // 手机屏幕里的内容整体淡化
+  ctx.save();
+  ctx.globalAlpha = 0.90 * p;
+  ctx.fillStyle = T.page;
+  ctx.fillRect(0, 0, W, H);
+  ctx.restore();
+  // 阴影底座
+  ctx.save();
+  ctx.shadowColor = 'rgba(0,0,0,.38)';
+  ctx.shadowBlur = 26;
+  ctx.shadowOffsetY = 10;
+  ctx.fillStyle = '#000';
+  rr(ctx, r.x, r.y, r.w, r.h, 12);
+  ctx.fill();
+  ctx.restore();
+  // 图片
+  const img = st.img;
+  if (img && img.complete && img.naturalWidth) {
+    ctx.save();
+    rr(ctx, r.x, r.y, r.w, r.h, 12);
+    ctx.clip();
+    const s = Math.max(r.w / img.naturalWidth, r.h / img.naturalHeight);
+    const w = img.naturalWidth * s, h = img.naturalHeight * s;
+    ctx.drawImage(img, r.x + (r.w - w) / 2, r.y + (r.h - h) / 2, w, h);
+    ctx.restore();
+  }
 }
 
 /* ============ 真人打字：键盘 + 音效 ============ */
@@ -3037,7 +3106,8 @@ function buildSchedule() {
     out.push(t);               // schedule[i] = 气泡出现时刻
     typeMsArr.push(typeMs);
     t += (980 + Math.random() * 520) * k;   // 到下一条的间隔
-    if (needsZoom(m)) t += ZOOM_EXTRA * k;  // 图片要放大，多停一会儿让观众看清
+    if (m.t === 'left' && m.kind === 'image') t += IMG_FX_EXTRA * k;   // 点开看图：留足放大 + 停留的时间
+    else if (needsZoom(m)) t += ZOOM_EXTRA * k;                        // 图片旁白：小幅呼吸
   });
   schedule = out;
   scheduleTypeMs = typeMsArr;
@@ -3212,14 +3282,19 @@ function drawChat(ctx, T, t, live) {
       if (t < fadeStart) return;
       p = Math.min(1, (t - fadeStart) / (isTyping ? KB_OUT : 240));
     }
-    // 图片旁白 / 别人发的图片：出现后短暂放大
+    // 图片旁白：出现后小幅呼吸
     let z = 1;
     if (live && needsZoom(m)) {
       const st = schedule[i] || 0;
-      const amp = (m.t === 'narrimg') ? ZOOM_AMP : ZOOM_AMP_IMG;
-      if (st >= 100 && t >= st) z = 1 + amp * zoomCurve((t - st) / ZOOM_DUR);
+      if (st >= 100 && t >= st) z = 1 + ZOOM_AMP * zoomCurve((t - st) / ZOOM_DUR);
     }
-    items.push({ m, p, z });
+    // 别人发的图片：被点一下 → 全屏放大 → 停 2 秒 → 复原
+    let fx = null;
+    if (live && m.t === 'left' && m.kind === 'image') {
+      const st = schedule[i] || 0;
+      if (st >= 100 && t >= st) fx = imageFxAt(t - st);
+    }
+    items.push({ m, p, z, fx });
   });
 
   // 下一条消息出现前先冒「正在输入」，本身也占一行，跟着一起往上滚
@@ -3239,9 +3314,10 @@ function drawChat(ctx, T, t, live) {
 
   let total = typing ? TYPING_H : 0;
   const heights = items.map(it => {
-    const h = block(ctx, it.m, 0, true, T, it.z);
+    const ro = {};
+    const h = block(ctx, it.m, 0, true, T, it.z, ro);   // 顺带量出图片在原位的位置
     total += h;
-    return h;
+    return { h, ro };
   });
 
   // 没满屏就贴着顶部堆，满了才开始滚动（跟真机一样）
@@ -3262,12 +3338,51 @@ function drawChat(ctx, T, t, live) {
   ctx.rect(0, BODY_TOP, W, H - BODY_TOP);
   ctx.clip();
 
+  // 正在点开看的那张图（飞出画面上方单独画，所以原位先藏起来）
+  let fxSt = null;
+
   items.forEach((it, i) => {
     const dy = (1 - it.p) * 16;
-    ctx.globalAlpha = it.p;
-    block(ctx, it.m, y + dy, false, T, it.z);
-    ctx.globalAlpha = 1;
-    y += heights[i];
+    const iy = y + dy;
+    const ro = heights[i].ro;
+    const fx = it.fx;
+    const hidden = fx && (fx.mode === 'open' || fx.mode === 'hold' || fx.mode === 'close');
+
+    if (!hidden) {
+      ctx.globalAlpha = it.p;
+      if (fx && fx.mode === 'tap') {
+        // 被点一下：整张图轻微缩小 + 压暗
+        const cx = ro.x + ro.w / 2, cy = iy + ro.y + ro.h / 2;
+        ctx.save();
+        ctx.translate(cx, cy);
+        ctx.scale(0.955, 0.955);
+        ctx.translate(-cx, -cy);
+        block(ctx, it.m, iy, false, T, it.z);
+        ctx.restore();
+        ctx.save();
+        rr(ctx, ro.x, iy + ro.y, ro.w, ro.h, 6);
+        ctx.clip();
+        ctx.fillStyle = 'rgba(0,0,0,.16)';
+        ctx.fillRect(ro.x, iy + ro.y, ro.w, ro.h);
+        ctx.restore();
+      } else {
+        block(ctx, it.m, iy, false, T, it.z);
+      }
+      ctx.globalAlpha = 1;
+    }
+
+    if (fx && (fx.mode === 'open' || fx.mode === 'hold' || fx.mode === 'close')) {
+      const img = it.m.imgKey ? MSG_IMAGES.get(it.m.imgKey) : null;
+      if (img && img.complete && img.naturalWidth) {
+        fxSt = {
+          img,
+          p: fx.p,
+          rect: { x: ro.x, y: iy + ro.y, w: ro.w, h: ro.h },
+          target: previewRect(img)
+        };
+      }
+    }
+    y += heights[i].h;
   });
 
   if (typing) drawTyping(ctx, y + 2, typing.prog, typing.right, T);
@@ -3286,6 +3401,9 @@ function drawChat(ctx, T, t, live) {
   drawInputBar(ctx, T, inputBarY, typedText);
   if (kbActive && candChars) drawCandidates(ctx, kbTop - CAND_H, candChars, T);
   if (kbActive) drawKeyboard(ctx, kbTop, pressedKey, T);
+
+  // 点开的图片画在最上层：盖住输入栏和导航栏，背后内容整体淡化
+  if (fxSt) drawImagePreviewOverlay(ctx, T, fxSt);
 }
 
 /* ============ 进入/返回群聊的滑动转场动画 ============ */
